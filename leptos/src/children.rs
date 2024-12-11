@@ -277,6 +277,7 @@ where
 
 /// A typed equivalent to [`ChildrenFn`], which takes a generic but preserves type information to
 /// allow the compiler to optimize the view more effectively.
+#[derive(Clone)]
 pub struct TypedChildrenFn<T>(Arc<dyn Fn() -> View<T> + Send + Sync>);
 
 impl<T> Debug for TypedChildrenFn<T> {
