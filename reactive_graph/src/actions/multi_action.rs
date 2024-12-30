@@ -5,6 +5,8 @@ use crate::{
     traits::{DefinedAt, Dispose, GetUntracked, Set, Update},
     unwrap_signal,
 };
+use any_spawner::Executor;
+use send_wrapper::SendWrapper;
 use std::{fmt::Debug, future::Future, panic::Location, pin::Pin, sync::Arc};
 
 /// An action that synchronizes multiple imperative `async` calls to the reactive system,
@@ -133,6 +135,104 @@ where
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
         }
+    }
+}
+
+impl<I, O> MultiAction<I, O, LocalStorage>
+where
+    I: 'static,
+    O: 'static,
+{
+    /// Creates a new multi-action, which does not require its inputs or outputs to be `Send`. In all other
+    /// ways, this is the same as [`MultiAction::new`]. If this action is accessed from outside the
+    /// thread on which it was created, it panics.
+    ///
+    /// ```rust
+    /// # use reactive_graph::actions::*;
+    /// # use reactive_graph::prelude::*;
+    /// # tokio_test::block_on(async move {
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
+    /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
+    /// // this can take non-Send types as input/output
+    /// let add_todo = MultiAction::new_local(|task: &String| {
+    ///   async move {
+    ///     // return a non-Send type
+    ///     std::rc::Rc::new(42)
+    ///   }
+    /// });
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn new_local<F, Fu>(action_fn: F) -> Self
+    where
+        F: Fn(&I) -> Fu + 'static,
+        Fu: Future<Output = O> + 'static,
+    {
+        Self {
+            inner: ArenaItem::new_local(ArcMultiAction::new_unsync(action_fn)),
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
+            defined_at: Location::caller(),
+        }
+    }
+}
+
+impl<I, O, S> MultiAction<I, O, S>
+where
+    I: 'static,
+    O: 'static,
+    S: Storage<ArcMultiAction<I, O>>,
+{
+    /// Calls the `async` function with a reference to the input type as its argument,
+    /// ensuring that it is spawned on the current thread.
+    ///
+    /// This can be called any number of times: each submission will be dispatched, running
+    /// concurrently, and its status can be checked via the
+    /// [`submissions_local()`](MultiAction::submissions_local) signal.
+    #[track_caller]
+    pub fn dispatch_local(&self, input: I) {
+        if !is_suppressing_resource_load() {
+            self.inner.try_with_value(|inner| {
+                if !is_suppressing_resource_load() {
+                    let fut = (inner.action_fn)(&input);
+
+                    let submission = ArcSubmission {
+                        input: ArcRwSignal::new(Some(input)),
+                        value: ArcRwSignal::new(None),
+                        pending: ArcRwSignal::new(true),
+                        canceled: ArcRwSignal::new(false),
+                    };
+
+                    inner
+                        .submissions
+                        .try_update(|subs| subs.push(submission.clone()));
+
+                    let version = inner.version.clone();
+
+                    Executor::spawn_local(async move {
+                        let new_value = fut.await;
+                        let canceled = submission.canceled.get_untracked();
+                        if !canceled {
+                            submission.value.try_set(Some(new_value));
+                        }
+                        submission.input.try_set(None);
+                        submission.pending.try_set(false);
+                        version.try_update(|n| *n += 1);
+                    });
+                }
+            });
+        }
+    }
+
+    /// The set of all submissions to this multi-action, returning a thread-local signal.
+    #[track_caller]
+    pub fn submissions_local(
+        &self,
+    ) -> ReadSignal<Vec<ArcSubmission<I, O>>, LocalStorage> {
+        let inner = self
+            .inner
+            .try_with_value(|inner| inner.submissions())
+            .unwrap_or_else(unwrap_signal!(self));
+        ReadSignal::from_local(inner)
     }
 }
 
@@ -434,6 +534,47 @@ impl<I, O> ArcMultiAction<I, O> {
             version: ArcRwSignal::new(0),
             submissions: ArcRwSignal::new(Vec::new()),
             action_fn,
+        }
+    }
+}
+
+impl<I, O> ArcMultiAction<I, O>
+where
+    I: 'static,
+    O: 'static,
+{
+    /// Creates a new multi-action that will only run on the thread in which it is created.
+    ///
+    /// In all other ways, this is identical to [`ArcMultiAction::new`].
+    ///
+    /// ```rust
+    /// # use reactive_graph::actions::*;
+    /// # use reactive_graph::prelude::*;
+    /// # tokio_test::block_on(async move {
+    /// # any_spawner::Executor::init_tokio(); let owner = reactive_graph::owner::Owner::new(); owner.set();
+    /// # let _guard = reactive_graph::diagnostics::SpecialNonReactiveZone::enter();
+    /// // this can take non-Send types as input/output
+    /// let add_todo = ArcMultiAction::new_unsync(|task: &String| {
+    ///   async move {
+    ///     // return a non-Send type
+    ///     std::rc::Rc::new(42)
+    ///   }
+    /// });
+    /// # });
+    /// ```
+    #[track_caller]
+    pub fn new_unsync<F, Fu>(action_fn: F) -> Self
+    where
+        F: Fn(&I) -> Fu + 'static,
+        Fu: Future<Output = O> + 'static,
+    {
+        let action_fn = SendWrapper::new(action_fn);
+        Self {
+            version: ArcRwSignal::new(0),
+            submissions: ArcRwSignal::new(Vec::new()),
+            action_fn: Arc::new(move |input| {
+                Box::pin(SendWrapper::new(action_fn(input)))
+            }),
         }
     }
 }
